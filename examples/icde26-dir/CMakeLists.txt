@@ -1,0 +1,8 @@
+set(BENCHMARK_HEADERS
+)
+
+set(BENCHMARK_SOURCES
+)
+
+ADD_FISHSTORE_BENCHMARK(sec2_more_data)
+ADD_FISHSTORE_BENCHMARK(constant_throughput_pr)

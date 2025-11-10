@@ -1,0 +1,200 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT license.
+
+#pragma once
+
+#include "tsl/hopscotch_map.h"
+#include "jit/ezpsf.h"
+
+
+namespace fishstore::core {
+    struct NullableInt {
+        bool is_null;
+        int32_t value;
+    };
+
+    static_assert(sizeof(NullableInt) == 8, "sizeof(PSFRetValue) != 8");
+
+    struct NullableStringRef {
+        bool is_null = true;
+        bool need_free = false;
+        uint32_t size = 0;
+        const char *payload = nullptr;
+    };
+
+    static_assert(sizeof(NullableStringRef) == 16, "sizeof(PSFRetValue) != 16");
+
+    // Inline PSF
+    template<class A>
+    using inline_psf_t = NullableInt(*)(const std::vector<typename A::field_t> &);
+
+    // General PSF
+    template<class A>
+    using general_psf_t = NullableStringRef(*)(const std::vector<typename A::field_t> &);
+
+    // if library id is >= 0, then it is considered an external library.
+    // if library id is == -1, then it is a projection
+    // if library id is == -2, then it is an EzPsf
+    constexpr int64_t LIB_PROJECTION = -1;
+    constexpr int64_t LIB_EZ_PSF = -2;
+
+    template<class A>
+    struct InlinePSF {
+        InlinePSF() {
+            fields.clear();
+            eval_ = nullptr;
+        }
+
+        inline NullableInt Eval(
+            const tsl::hopscotch_map<uint16_t, typename A::field_t> &field_map) {
+            std::vector<typename A::field_t> args;
+            args.reserve(fields.size());
+            for (auto &field_id: fields) {
+                auto it = field_map.find(field_id);
+                if (it == field_map.end()) return NullableInt();
+                args.emplace_back(it->second);
+            }
+            return eval_(args);
+        }
+
+        std::vector<uint16_t> fields;
+
+        union {
+            inline_psf_t<A> eval_;
+            ezpsf::EzPsf ez_eval;
+        };
+
+        int64_t lib_id;
+        std::string func_name;
+    };
+
+    template<class A>
+    struct GeneralPSF {
+        GeneralPSF() {
+            fields.clear();
+            eval_ = nullptr;
+            lib_id = -1;
+            func_name = "";
+            ret_type = ezpsf::DataType::ERROR_T;
+        }
+
+        inline NullableStringRef Eval(
+            const tsl::hopscotch_map<uint16_t, typename A::field_t> &field_map) {
+            std::vector<typename A::field_t> args;
+            args.reserve(fields.size());
+            for (auto &field_id: fields) {
+                auto it = field_map.find(field_id);
+                if (it == field_map.end()) return NullableStringRef();
+                args.emplace_back(it->second);
+            }
+            return eval_(args);
+        }
+
+        std::vector<uint16_t> fields;
+
+        union {
+            general_psf_t<A> eval_;
+            ezpsf::EzPsf ez_eval;
+        };
+
+        int64_t lib_id;
+        std::string func_name;
+
+        ezpsf::DataType ret_type;
+    };
+
+    template<class A>
+    inline NullableStringRef projection(const std::vector<typename A::field_t> &fields) {
+        auto ref = fields[0].GetAsStringRef();
+        if (ref.HasValue()) {
+            auto val = ref.Value();
+            return NullableStringRef{false, false, static_cast<uint32_t>(val.Length()), val.Data()};
+        } else return NullableStringRef{};
+    }
+
+    enum class PsfType : uint8_t {
+        GENERAL = 0b00, // mode 0 in key pointer
+        INLINE = 0b01, // mode 1 in key pointer
+        ERROR = 0b11 // invalid PsfType (FullScan most likely)
+    };
+
+    template<class A>
+    struct AnyPsf {
+        union {
+            GeneralPSF<A> general_psf;
+            InlinePSF<A> inline_psf;
+        };
+
+        PsfType type;
+    };
+
+    // Represents a reference to a psf within fishstore
+    struct PsfLookup {
+        static constexpr uint32_t NO_PSF_ID = 0x3FFFFFFF; // 30 bits of 1s
+
+        // default constructor makes -1
+        PsfLookup() : id(NO_PSF_ID), type(PsfType::ERROR) {
+        }
+
+        PsfLookup(uint32_t id, PsfType type) : id(id), type(type) {
+        }
+
+        static PsfLookup Inline(uint32_t id) {
+            assert(id != -1 || id != NO_PSF_ID && "This method requires that a PSF have id defined");
+            return {id, PsfType::INLINE};
+        }
+
+        static PsfLookup General(uint32_t id) {
+            assert(id != -1 || id != NO_PSF_ID && "This method requires that a PSF have id defined");
+            return {id, PsfType::GENERAL};
+        }
+
+        uint32_t id: 30;
+        PsfType type: 2;
+
+        bool operator==(const PsfLookup &other) const {
+            return id == other.id && type == other.type;
+        }
+
+        bool operator!=(const PsfLookup &other) const {
+            return !(*this == other);
+        }
+
+        [[nodiscard]] constexpr bool isInline() const { return type == PsfType::INLINE; }
+
+        [[nodiscard]] constexpr bool isGeneral() const { return type == PsfType::GENERAL; }
+
+        // generated by Clion Nova 2024.1 EAP
+        static std::size_t hash(const PsfLookup &obj) {
+            std::size_t seed = 0x7F665862;
+            seed ^= (seed << 6) + (seed >> 2) + 0x541C18BF + static_cast<std::size_t>(obj.id);
+            seed ^= (seed << 6) + (seed >> 2) + 0x5C917467 + static_cast<std::size_t>(obj.type);
+            return seed;
+        }
+
+        [[nodiscard]] std::string toString() const {
+            const auto my_str = std::to_string(id);
+            switch (type) {
+                case PsfType::INLINE:
+                    return "[Inline Psf: " + my_str + "]";
+                case PsfType::GENERAL:
+                    return "[General Psf: " + my_str + "]";
+                case PsfType::ERROR:
+                    return "[Error: " + my_str + "]";
+                default:
+                    assert(false && "Invalid type!");
+                    return "[INVALID TYPE: " + my_str + "]";
+            }
+        }
+    };
+
+    static_assert(sizeof(PsfLookup) == sizeof(int32_t));
+} // namespace fishstore::core
+
+
+template<>
+struct std::hash<fishstore::core::PsfLookup> {
+    std::size_t operator()(const fishstore::core::PsfLookup &obj) const noexcept {
+        return fishstore::core::PsfLookup::hash(obj);
+    }
+};
